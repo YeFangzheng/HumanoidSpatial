@@ -1,0 +1,388 @@
+import os
+import json
+import tqdm
+import pickle
+from pypcd import pypcd  # pip install git+https://github.com/DanielPollithy/pypcd.git
+import cv2 as cv
+import torch
+import torch.nn.functional as F
+import numpy as np
+from scipy.spatial.transform import Rotation as R
+import multiprocessing as mp
+
+import supervision as sv
+import open3d as o3d
+import numba as nb
+from mmdet3d.structures.bbox_3d import LiDARInstance3DBoxes
+
+
+# ========================= outdoor classes（你已确认） =========================
+classes = [
+    'animal',
+    'bicycle',
+    'chair',
+    'cyclist',
+    'equipment',
+    'irregular_pedestrian',
+    'objects',
+    'pedestrian',
+    'plant',
+    'table',
+    'tricycle',
+    'vehicle',
+]
+# =============================================================================
+
+
+voxel_size = 0.1
+pc_range = [-10, -10, -1.5, 10, 10, 0.9]
+occ_size = [200, 200, 24]
+blind_ranges = [(83.61, 96.1), (125.56, 135.97), (-96.1, -83.61), (-135.97, -125.56)]  # lidar盲区角度区间
+
+# ========================= label 约定（与图一致） =========================
+UNKNOWN_LABEL = 255
+OTHERS_LABEL_ID = 12  # 其他（others） -> unknown(255)
+# =============================================================================
+
+
+# ========================= 数据根目录（按实际改） =========================
+data_root = '$PATH_TO_DATASET$/Data_outdoor'  # <-- 修改为你的室外数据根目录
+# =============================================================================
+
+with open(f'{data_root}/clips.json') as f:
+    clip_infos = json.load(f)
+with open(f'{data_root}/frames.json') as f:
+    frame_infos = json.load(f)
+
+token2ind = dict()
+for ind, frame in enumerate(frame_infos):
+    token2ind[frame['token']] = ind
+
+
+# ===================== 新增：异常日志（不打印到命令行） =====================
+LOG_PATH = os.path.join(data_root, 'occ_generation_errors.log')
+
+def log_error(scene_token: str, err: Exception):
+    """
+    只写文件，不 print，不影响生成逻辑。
+    """
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    reason = f'{type(err).__name__}: {str(err).replace(chr(10), " ").replace(chr(13), " ")}'
+    with open(LOG_PATH, 'a', encoding='utf-8') as f:
+        f.write(f'{scene_token}\t{reason}\n')
+# =======================================================================
+
+
+# u1: uint8, u8: uint16, i8: int64
+@nb.jit('u1[:,:,:](u1[:,:,:],i8[:,:])', nopython=True, cache=True, parallel=False)
+def nb_process_label(processed_label, sorted_label_voxel_pair):
+    label_size = 256
+    counter = np.zeros((label_size,), dtype=np.uint16)
+    counter[sorted_label_voxel_pair[0, 3]] = 1
+    cur_sear_ind = sorted_label_voxel_pair[0, :3]
+    for i in range(1, sorted_label_voxel_pair.shape[0]):
+        cur_ind = sorted_label_voxel_pair[i, :3]
+        if not np.all(np.equal(cur_ind, cur_sear_ind)):
+            if counter.sum() > 0:  # denoise（注意：原逻辑保留，不做结构性修改）
+                if counter[:-1].sum() == 0:
+                    processed_label[cur_sear_ind[0], cur_sear_ind[1], cur_sear_ind[2]] = 255
+                else:
+                    processed_label[cur_sear_ind[0], cur_sear_ind[1], cur_sear_ind[2]] = np.argmax(counter[:-1])
+            else:
+                processed_label[cur_sear_ind[0], cur_sear_ind[1], cur_sear_ind[2]] = 0
+            counter = np.zeros((label_size,), dtype=np.uint16)
+            cur_sear_ind = cur_ind
+        counter[sorted_label_voxel_pair[i, 3]] += 1
+    processed_label[cur_sear_ind[0], cur_sear_ind[1], cur_sear_ind[2]] = np.argmax(counter)
+
+    return processed_label
+
+
+def process_clip(clip_info):
+    try:
+        frames = clip_info['frames']
+        scene_token = clip_info['token']
+
+        # 读取当前clip叠帧点云标签（静态）
+        stack_pc = pypcd.PointCloud.from_path(f'{data_root}/annotation/stack/{scene_token}.pcd')
+        stack_points = np.zeros([stack_pc.width, 3], dtype=np.float32)
+        stack_points[:, 0] = stack_pc.pc_data['x'].copy()
+        stack_points[:, 1] = stack_pc.pc_data['y'].copy()
+        stack_points[:, 2] = stack_pc.pc_data['z'].copy()
+        stack_labels = np.zeros([stack_pc.width], dtype=np.int32)
+        stack_labels[:] = stack_pc.pc_data[['class']].copy()
+
+        # 去掉“静态行人类别”（沿用原逻辑：label=1）
+        stack_points = stack_points[stack_labels != 1]
+        stack_labels = stack_labels[stack_labels != 1]
+
+        # 需要按 bbox 对齐叠帧的“动态类”（室外扩展）
+        DYNAMIC_TYPES = set([
+            'pedestrian',
+            'irregular_pedestrian',
+            'cyclist',
+            'vehicle',
+        ])
+
+        # bbox_type -> seg_id（只用于“语义过滤增强抠点纯度”）
+        # 注意：如果某 seg_id 在点云语义里根本不存在（比如车辆/骑行者语义分割不标注），代码会自动跳过该语义过滤，不会把点抠空。
+        BBOX_TYPE_TO_SEG_ID = {
+            'pedestrian': 1,
+            'irregular_pedestrian': 1,
+            'cyclist': 17,
+            'vehicle': 19,
+            'bicycle': 16,
+            'tricycle': 18,
+        }
+
+        # ------------------- Pass 1: 提取每帧动态目标点（存到 zoo） -------------------
+        dynamic_zoo = dict()
+        dynamic_blind_flag = dict()
+
+        for token in frames:
+            frame = frame_infos[token2ind[token]]
+            frame_id = frame['frame_id']
+            lidar_path = frame['lidars']['LIDAR_TOP']['lidar_path']
+            lidar2ego = np.array(frame['lidars']['LIDAR_TOP']['lidar2ego'])
+            bbox_path = frame['bbox_path']
+
+            # 读取单帧点云 + 语义标签
+            seg_pc = pypcd.PointCloud.from_path(os.path.join(data_root, lidar_path))
+            seg_points = np.zeros([seg_pc.width, 3], dtype=np.float32)
+            seg_points[:, 0] = seg_pc.pc_data['x'].copy()
+            seg_points[:, 1] = seg_pc.pc_data['y'].copy()
+            seg_points[:, 2] = seg_pc.pc_data['z'].copy()
+            seg_points = seg_points @ lidar2ego[:3, :3].T + lidar2ego[:3, 3]  # lidar -> ego
+
+            seg_labels = np.zeros([seg_pc.width], dtype=np.int32)
+            seg_labels[:] = seg_pc.pc_data[['class']].copy()
+
+            # 读取 bbox
+            with open(f'{data_root}/{bbox_path}', 'r') as f:
+                lines = f.readlines()
+            kitti_bboxes = [line.strip().split() for line in lines]
+
+            for kitti_bbox in kitti_bboxes:
+                obj_type = kitti_bbox[0]
+                if obj_type not in DYNAMIC_TYPES:
+                    continue
+
+                obj = {
+                    'type': obj_type,
+                    'dimensions': [float(x) for x in kitti_bbox[1:4][::-1]],
+                    'location': [float(x) for x in kitti_bbox[4:7]],
+                    'yaw': float(kitti_bbox[7]),
+                    'track_id': int(kitti_bbox[8]),
+                }
+
+                bbox = LiDARInstance3DBoxes(
+                    [obj['location'] + obj['dimensions'] + [obj['yaw']]],
+                    origin=(0.5, 0.5, 0.5)
+                )
+                box_idx = bbox.points_in_boxes_part(torch.tensor(seg_points, device='cuda', dtype=torch.float32))
+                in_box = box_idx.cpu().numpy() == 0
+
+                # 语义过滤（保守：仅当该 seg_id 在点云里真实存在时才启用）
+                if obj_type in BBOX_TYPE_TO_SEG_ID:
+                    seg_id = BBOX_TYPE_TO_SEG_ID[obj_type]
+                    if np.any(seg_labels == seg_id):
+                        in_box = np.logical_and(in_box, seg_labels == seg_id)
+
+                obj_points = seg_points[in_box]
+
+                # ego -> obj
+                obj2ego = np.eye(4)
+                obj2ego[:3, :3] = R.from_euler('z', obj['yaw']).as_matrix()
+                obj2ego[:3, 3] = obj['location']
+                ego2obj = np.linalg.inv(obj2ego)
+                obj_points = obj_points @ ego2obj[:3, :3].T + ego2obj[:3, 3]
+
+                # 盲区判断（沿用原逻辑）
+                azimuth = np.arctan2(obj['location'][1], obj['location'][0]) / np.pi * 180
+                in_blind = False
+                for r in blind_ranges:
+                    if azimuth > r[0] and azimuth < r[1]:
+                        in_blind = True
+                        break
+                if np.linalg.norm(obj['location'][:2]) < 1.2:
+                    in_blind = True
+
+                track_id = obj['track_id']
+                if track_id not in dynamic_zoo:
+                    dynamic_zoo[track_id] = dict()
+                    dynamic_blind_flag[track_id] = dict()
+                dynamic_zoo[track_id][frame_id] = obj_points
+                dynamic_blind_flag[track_id][frame_id] = in_blind
+
+        # ------------------- Pass 2: 逐帧融合静态+动态，生成 occ -------------------
+        for token in frames:
+            frame = frame_infos[token2ind[token]]
+            frame_id = frame['frame_id']
+            bbox_path = frame['bbox_path']
+
+            with open(f'{data_root}/{bbox_path}', 'r') as f:
+                lines = f.readlines()
+            kitti_bboxes = [line.strip().split() for line in lines]
+
+            dynamic_points = []
+            dynamic_labels = []
+
+            for kitti_bbox in kitti_bboxes:
+                obj_type = kitti_bbox[0]
+                if obj_type not in DYNAMIC_TYPES:
+                    continue
+
+                obj = {
+                    'type': obj_type,
+                    'dimensions': [float(x) for x in kitti_bbox[1:4][::-1]],
+                    'location': [float(x) for x in kitti_bbox[4:7]],
+                    'yaw': float(kitti_bbox[7]),
+                    'track_id': int(kitti_bbox[8]),
+                }
+                obj2ego = np.eye(4)
+                obj2ego[:3, :3] = R.from_euler('z', obj['yaw']).as_matrix()
+                obj2ego[:3, 3] = obj['location']
+                track_id = obj['track_id']
+
+                # 叠帧范围（保守设置；结构与原逻辑一致，只是扩到室外动态类）
+                if track_id not in dynamic_zoo or frame_id not in dynamic_blind_flag.get(track_id, {}):
+                    continue
+
+                if obj_type == 'pedestrian':
+                    seq = range(-8, 9)
+                    if dynamic_blind_flag[track_id][frame_id]:
+                        seq = range(-9, 10)
+                    out_label = 1
+
+                elif obj_type == 'irregular_pedestrian':
+                    seq = range(-5, 6)
+                    if dynamic_blind_flag[track_id][frame_id]:
+                        seq = range(-6, 7)
+                    out_label = 1
+
+                elif obj_type == 'cyclist':
+                    seq = range(-7, 8)
+                    if dynamic_blind_flag[track_id][frame_id]:
+                        seq = range(-8, 9)
+                    out_label = 17
+
+                elif obj_type == 'vehicle':
+                    seq = range(-9, 10)
+                    if dynamic_blind_flag[track_id][frame_id]:
+                        seq = range(-10, 11)
+                    out_label = 19
+
+                else:
+                    continue
+
+                for offset in seq:
+                    fid = frame_id + offset
+                    if fid in dynamic_zoo[track_id].keys():
+                        obj_points = dynamic_zoo[track_id][fid] @ obj2ego[:3, :3].T + obj2ego[:3, 3]
+                        dynamic_points.append(obj_points)
+                        dynamic_labels.append(np.full(len(obj_points), out_label, dtype=np.int32))
+
+            if len(dynamic_points) > 0:
+                dynamic_points = np.concatenate(dynamic_points, axis=0)
+                dynamic_labels = np.concatenate(dynamic_labels, axis=0)
+            else:
+                dynamic_points = np.zeros((0, 3), dtype=np.float32)
+                dynamic_labels = np.zeros((0), dtype=np.int32)
+
+            # 静态点云（叠帧标注） + 动态点云（包围框对齐叠帧）
+            ego2global = np.array(frame['ego2global'])
+            global2ego = np.linalg.inv(ego2global)
+            static_points = stack_points @ global2ego[:3, :3].T + global2ego[:3, 3]
+            occ_points = np.concatenate([static_points, dynamic_points], axis=0)
+            occ_labels = np.concatenate([stack_labels, dynamic_labels], axis=0)
+
+            # points & labels in range
+            range_mask = (np.abs(occ_points[:, 0]) < pc_range[3]) & (np.abs(occ_points[:, 1]) < pc_range[4]) \
+                & (occ_points[:, 2] > pc_range[2]) & (occ_points[:, 2] < pc_range[5])
+            points = occ_points[range_mask]
+            labels = occ_labels[range_mask]
+
+            # 0 for unoccupied, 255 for unknown
+            labels[labels == OTHERS_LABEL_ID] = UNKNOWN_LABEL  # others -> unknown
+
+            # OCC 生成时过滤掉 unknown(255)，使其不参与体素投票/不产生占据
+            keep_mask = (labels != UNKNOWN_LABEL)
+            points = points[keep_mask]
+            labels = labels[keep_mask]
+
+            lidar_path = frame['lidars']['LIDAR_TOP']['lidar_path']
+            file_name = os.path.basename(lidar_path).replace('pcd', 'npz')
+            occ_out_path = f'{data_root}/annotation/occ/{scene_token}/{file_name}'
+            if not os.path.exists(os.path.dirname(occ_out_path)):
+                os.makedirs(os.path.dirname(occ_out_path))
+
+            # 过滤后可能为空：保存空 occ（细节保护，不改主逻辑）
+            if points.shape[0] == 0:
+                processed_label = np.zeros(occ_size, dtype=np.uint8)
+                np.savez(occ_out_path, occ=processed_label)
+                continue
+
+            # convert points to voxels
+            pcd_np_coor = points
+            pcd_np_coor[:, 0] = (pcd_np_coor[:, 0] - pc_range[0]) / voxel_size
+            pcd_np_coor[:, 1] = (pcd_np_coor[:, 1] - pc_range[1]) / voxel_size
+            pcd_np_coor[:, 2] = (pcd_np_coor[:, 2] - pc_range[2]) / voxel_size
+            pcd_np_coor = np.floor(pcd_np_coor).astype(np.int32)
+            pcd_np = np.concatenate([pcd_np_coor, labels[..., None]], axis=-1)
+
+            pcd_np = pcd_np[np.lexsort((pcd_np_coor[:, 0], pcd_np_coor[:, 1], pcd_np_coor[:, 2])), :]
+            pcd_np = pcd_np.astype(np.int64)
+            processed_label = np.zeros(occ_size, dtype=np.uint8)
+            processed_label = nb_process_label(processed_label, pcd_np)
+
+            ################# convert voxel coordinates to LiDAR system  ##############
+            x = np.linspace(0, occ_size[0] - 1, occ_size[0])
+            y = np.linspace(0, occ_size[1] - 1, occ_size[1])
+            z = np.linspace(0, occ_size[2] - 1, occ_size[2])
+            X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+            vv = np.stack([X, Y, Z], axis=-1)
+
+            # 不画 255（unknown）
+            vis_mask = (processed_label > 0) & (processed_label != UNKNOWN_LABEL)
+            fov_voxels = vv[vis_mask]
+            fov_voxels[:, :3] = (fov_voxels[:, :3] + 0.5) * voxel_size
+            fov_voxels[:, 0] += pc_range[0]
+            fov_voxels[:, 1] += pc_range[1]
+            fov_voxels[:, 2] += pc_range[2]
+            fov_labels = processed_label[vis_mask]
+
+            np.savez(occ_out_path, occ=processed_label)
+
+    except Exception as e:
+        raise e
+
+
+# ===================== 新增：安全包装（异常 token 跳过 + 写log） =====================
+def safe_process_clip(clip_info):
+    """
+    仅做容错，不影响任何 OCC 生成逻辑：
+    - 成功：返回 True
+    - 失败：记录 token 和原因到 log 文件，返回 False
+    """
+    scene_token = clip_info.get('token', 'UNKNOWN_TOKEN')
+    try:
+        process_clip(clip_info)
+        return True
+    except Exception as e:
+        log_error(scene_token, e)
+        return False
+# ============================================================================
+
+
+if __name__ == '__main__':
+    mp.set_start_method('spawn')
+
+    # 单 clip 调试（改 token）
+    # for clip_info in clip_infos:
+    #     if clip_info['token'] == '6901e72823f5b14ae9a8aa20':
+    #         process_clip(clip_info)
+
+    # 多进程全量跑（可选）：不中断，异常 clip 记日志
+    # 注意：这里用 safe_process_clip，而不是 process_clip
+    with mp.Pool(4) as pool:
+        results = list(tqdm.tqdm(pool.imap(safe_process_clip, clip_infos), total=len(clip_infos)))

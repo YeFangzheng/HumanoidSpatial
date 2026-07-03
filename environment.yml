@@ -1,0 +1,51 @@
+name: occupancy-giga
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch>=2.0.0
+  - torchvision
+  - cudatoolkit=12.1
+  - pip
+  - pip:
+    # Core dependencies
+    - mmengine>=0.10.0
+    - mmcv>=2.0.0
+    - mmdet>=3.0.0
+    - mmsegmentation>=1.2.0,<1.3.0
+    - mmdet3d>=1.4.0
+    
+    # GaussianFormer dependencies
+    - timm
+    - spconv-cu121
+    
+    # Common dependencies
+    - numpy
+    - scipy
+    - pandas
+    - opencv-python
+    - pillow
+    - matplotlib
+    - seaborn
+    - pyyaml
+    - yapf
+    - addict
+    - packaging
+    - rich
+    - tqdm
+    
+    # Optional but recommended
+    - tensorboard
+    - wandb
+    
+    # Code quality
+    - pre-commit
+    - flake8
+    - black
+    - isort
+    
+    # Testing
+    - pytest
