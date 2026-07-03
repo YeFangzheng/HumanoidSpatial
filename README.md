@@ -1,4 +1,4 @@
-# Occupancy Giga-benchmark
+# HSP-benchmark
 
 A comprehensive benchmark for 3D occupancy prediction with 10 state-of-the-art models on humanoid robot perception tasks.
 
@@ -163,9 +163,9 @@ pip install mmcv==2.1.0 -f https://download.openmmlab.com/mmcv/dist/cu124/torch2
 ## Citation
 
 ```bibtex
-@article{occupancy_giga,
-  title={Occupancy Giga-benchmark: A Comprehensive Benchmark for 3D Occupancy Prediction on Humanoid Robots},
-  year={2024}
+@article{HumanoidSpatial,
+  title={HumanoidSpatial},
+  year={2026}
 }
 ```
 
